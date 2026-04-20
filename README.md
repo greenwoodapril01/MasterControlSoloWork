@@ -41,17 +41,17 @@ Identify high  customer segments and ideal customers
 Collaborate effectively within a team to produce reproducible insights
 
 ## Repository Contents
-'April Master Control -EDA.Rmd'
+-'April Master Control -EDA.Rmd'
 R Script, Exploratory Data Analysis, initial data cleaning and data insights 
 
-'April-Master-Control--EDA.html' 
+-'April-Master-Control--EDA.html' 
 HTML file of Exploratory Data Analysis
 
-'Modeling-Mastercontrol_April-Add.Rmd' 
+-'Modeling-Mastercontrol_April-Add.Rmd' 
 R Markdown file containing my initial predictive modeling workflow and model evaluation.
 
-'Modeling-Mastercontrol_April-Add.html' 
+-'Modeling-Mastercontrol_April-Add.html' 
 HTML file containting my intial predictive modeling workflow and model evaluation.
 
-'README.md'
+-'README.md'
 Project documentation describing the business problem and project insights
