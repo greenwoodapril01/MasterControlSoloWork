@@ -1,0 +1,242 @@
+---
+title: "MasterControl-EDA"
+author: "April Greenwood"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Business Problem
+
+Master Control seeks to improve sales efficiency by identifying which Qualified Account Leads (QALs) are most likely to progress to SQL, SQO, or Won. 
+
+Understanding conversion drivers will allow the company to prioritize high-value leads, allocate sales resources efficiently, improve targeting by product and industry, and increase overall revenue conversion.
+
+## Target Variable
+
+**Target Variable:** `lead_success`
+1 = Lead converted (SQL, SQO, or Won)
+0 = Lead did not convert
+
+Our objective is to model the probability of a lead being successful. 
+
+# Load Libraries and Data
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(janitor)
+library(tidyr)
+
+# Load dataset
+qal_data <- read_csv("C:/Users/green/Downloads/QAL Performance for MSBA.csv") %>%
+  clean_names()
+
+qal_analysis <- qal_data
+
+```
+
+```{r}
+# Examine structure
+str(qal_analysis)
+
+# Summary statistics
+summary(qal_analysis)
+```
+
+# Target variable
+```{r}
+
+colnames(qal_analysis)
+unique(qal_analysis$next_stage_c)
+
+qal_analysis <- qal_analysis %>%
+  mutate(
+    lead_success = case_when(
+      next_stage_c %in% c("SQL", "SQO", "Won") ~ 1,
+      next_stage_c %in% c("Lost", "Recycled", "Exclude", "MQL", "INQ") ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+qal_analysis <- qal_analysis %>%
+  filter(!is.na(lead_success))
+
+# Convert categorical variables to factors
+qal_analysis$solution_rollup <- as.factor(qal_analysis$solution_rollup)
+qal_analysis$acct_target_industry <- as.factor(qal_analysis$acct_target_industry)
+
+# Calculate overall success rate
+overall_summary <- qal_analysis %>%
+  summarise(
+    Total_Leads = n(),
+    Successes = sum(lead_success),
+    Conversion_Rate = round(100 * mean(lead_success), 2)
+  )
+
+overall_summary
+
+ggplot(qal_analysis, aes(x = factor(lead_success))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = "Overall Lead Conversion Distribution",
+    x = "Lead Success (0 = No, 1 = Yes)",
+    y = "Number of Leads"
+  ) +
+  theme_minimal()
+
+```
+The overall conversion rate is low, which means the data is imbalanced. Because of this, the model should be evaluated using metrics like AUC, recall, or precision instead of accuracy alone.
+
+# Conversion by product family 
+
+```{r}
+product_summary <- qal_analysis %>%
+  group_by(solution_rollup) %>%
+  summarise(
+    Total_Leads = n(),
+    Successes = sum(lead_success),
+    Conversion_Rate = round(100 * mean(lead_success), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Conversion_Rate))
+
+product_summary
+
+ggplot(qal_analysis, aes(x = solution_rollup, fill = factor(lead_success))) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Conversion Rate by Product Family",
+    x = "Product Family",
+    y = "Proportion",
+    fill = "Lead Success"
+  ) +
+  theme_minimal()
+
+```
+Product family shows meaningful variation in conversion rates, suggesting that product may influence progression outcomes. This variable is likely to be a strong predictor in the model.
+
+#conversion by industry 
+```{r industry_summary}
+industry_summary <- qal_analysis %>%
+  group_by(acct_target_industry) %>%
+  summarise(
+    Total_Leads = n(),
+    Successes = sum(lead_success),
+    Conversion_Rate = round(100 * mean(lead_success), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Total_Leads))
+
+industry_summary
+
+ggplot(industry_summary, 
+       aes(x = reorder(acct_target_industry, Conversion_Rate),
+           y = Conversion_Rate)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(
+    title = "Conversion Rate by Industry",
+    x = "Industry",
+    y = "Conversion Rate (%)"
+  ) +
+  theme_minimal()
+```
+
+# Missing Data assassment and treatment
+```{r missing_data}
+missing_counts <- colSums(is.na(qal_analysis))
+missing_counts
+
+qal_analysis <- qal_analysis %>%
+  mutate(
+    across(
+      c(acct_primary_site_function,
+        acct_manufacturing_model,
+        acct_target_industry,
+        contact_lead_title,
+        priority,
+        acct_territory_rollup,
+        acct_tier_rollup,
+        solution,
+        solution_rollup,
+        last_tactic_campaign_channel),
+      ~ ifelse(is.na(.), "Unknown", .)
+    )
+  )
+
+qal_analysis <- qal_analysis %>%
+  mutate(
+    across(
+      c(acct_primary_site_function,
+        acct_manufacturing_model,
+        acct_target_industry,
+        contact_lead_title,
+        priority,
+        acct_territory_rollup,
+        acct_tier_rollup,
+        solution,
+        solution_rollup,
+        last_tactic_campaign_channel),
+      as.factor
+    )
+  )
+
+
+colSums(is.na(qal_analysis))
+nrow(qal_analysis)
+```
+
+**Interpretation**
+
+Any variables with substantial missingness must be addressed prior to modeling. Options include:
+- Removing rows
+- Imputing values
+- Creating “Unknown” categories
+
+Observations with missing stage outcomes were removed to maintain a complete target variable. Missing categorical predictors were recoded as “Unknown” to preserve data and capture potential informational value, and non-informative identifier fields were excluded from analysis.
+
+# Questions Guiding Exploration
+
+- What is the overall conversion rate?
+- Does product family influence conversion?
+- Does industry influence conversion?
+- Are there sparse categories?
+- Are there missing values?
+- Do numeric predictors show skewness?
+- Are some variables highly correlated?
+- Which predictors appear strongest visually?
+
+# Results and Key Insights
+
+## Key Findings
+
+The overall conversion rate indicates class imbalance.
+Product shows meaningful variation in conversion rates.
+Several industry categories appear to have low observation counts, which may produce unstable conversion estimates. These sparse categories may need consolidation prior to modeling.
+
+## Data Issues Identified
+
+- Class imbalance
+- Potential sparse industry categories
+- Possible missing values
+
+## Impact on Modeling Strategy
+
+Given the binary target and class imbalance:
+
+- Logistic regression with class weighting could be useful
+- Tree-based models may capture nonlinear relationships.
+- Evaluation metrics should prioritize recall, precision, and AUC over accuracy.
+
+The EDA suggests that product family and industry are promising predictors and should be retained in all candidate models.
+
+---
+
+# Conclusion
+
+Exploratory Data Analysis reveals meaningful differences in conversion performance across product families and industries. The dataset is suitable for classification modeling, though careful preprocessing and imbalance handling will be required.
+
+This EDA has clarified the modeling objective, identified potential data challenges, and informed the selection of appropriate predictive techniques.

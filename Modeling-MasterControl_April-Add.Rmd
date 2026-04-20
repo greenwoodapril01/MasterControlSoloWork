@@ -1,0 +1,812 @@
+---
+title: "MOdeling Assingment"
+author: "Group-5 {April Greenwood, Amiya Ranjan Sahoo, Caleb Call, Rob Sheehy}"
+date: "March 21, 2026"
+output:
+  html_document:
+    toc: yes
+
+---
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+---
+
+# 1. Introduction
+
+This file evaluates different models to identify which leads are most likely to advance to the next sales step. The EDA established that manufacturing mode is the strongest predictor, followed by account tier, functional area of the contact, and seniority. Geography and industry showed weaker standalone effects but remain useful interaction features.
+
+There are 3 differnet prections used in this file: Logistic Regression, XGBoost, and Random Forest. Outcomes are compared using AUC, accuracy, pecision, recall and F1
+
+---
+
+# 2. Import Libraries
+
+```{r}
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(janitor)
+library(lubridate)
+library(caret)        
+library(recipes) 
+library(rsample)       
+library(xgboost)       
+library(randomForest)   
+library(pROC)           
+library(yardstick)    
+library(ggplot2)
+library(scales)
+library(gridExtra)
+library(gt)
+
+theme_set(theme_minimal(base_size = 12))
+set.seed(123)
+```
+
+---
+
+# 3. Data Overview
+This step includes creating a target variable, cleans misisng values, and extracts seniority from jobs. 
+
+```{r}
+# Load data 
+
+qal_raw <- read_csv("Mastercontrol QAL Performance.csv") %>%
+  clean_names()
+
+cat("Dimensions:", nrow(qal_raw), "rows ×", ncol(qal_raw), "columns\n")
+```
+
+```{r}
+#EDA data cleaning
+
+qal <- qal_raw %>%
+
+# Target variable
+  mutate(
+    progressed = if_else(next_stage_c %in% c("SQL", "SQO", "Won"), 1L, 0L)
+  ) %>%
+  
+  mutate(
+    acct_primary_site_function = replace_na(acct_primary_site_function, "Unknown"),
+    acct_manufacturing_model   = replace_na(acct_manufacturing_model,   "Unknown"),
+    contact_lead_title         = replace_na(contact_lead_title,         "Unknown")
+  ) %>%
+
+  mutate(
+    title_lower = tolower(contact_lead_title),
+    seniority = case_when(
+      str_detect(title_lower, "chief|ceo|cfo|cio|cto|coo|president") ~ "C-Level",
+      str_detect(title_lower, "vp|vice president")                   ~ "VP",
+      str_detect(title_lower, "director|head")                       ~ "Director",
+      str_detect(title_lower, "manager|lead")                        ~ "Manager",
+      TRUE                                                            ~ "Other"
+    )
+  ) %>%
+
+  mutate(
+    function_band = case_when(
+      str_detect(title_lower, "quality|qa|qc")                    ~ "Quality",
+      str_detect(title_lower, "manufactur|production|plant")      ~ "Manufacturing",
+      str_detect(title_lower, "operation|ops")                    ~ "Operations",
+      str_detect(title_lower, "regulator|compliance")             ~ "Regulatory",
+      str_detect(title_lower, "engineer|process")                 ~ "Engineering",
+      TRUE                                                         ~ "Other"
+    )
+  ) %>%
+
+  mutate(
+    cohort_month = month(qal_cohort_date, label = TRUE, abbr = TRUE)
+  ) %>%
+
+  select(-qal_id, -contact_lead_id, -next_stage_c,
+         -contact_lead_title, -title_lower, -qal_cohort_date)
+
+qal <- qal %>%
+  mutate(
+    progressed             = factor(progressed, levels = c(0, 1),
+                                    labels = c("No", "Yes")),
+    solution_rollup        = factor(solution_rollup),
+    acct_target_industry   = factor(acct_target_industry),
+    acct_manufacturing_model = factor(acct_manufacturing_model),
+    acct_primary_site_function = factor(acct_primary_site_function),
+    acct_tier_rollup       = factor(acct_tier_rollup),
+    acct_territory_rollup  = factor(acct_territory_rollup),
+    last_tactic_campaign_channel = factor(last_tactic_campaign_channel),
+    priority               = factor(priority),
+    seniority              = factor(seniority),
+    function_band          = factor(function_band),
+    cohort_month           = factor(cohort_month)
+  )
+
+cat("Target distribution:\n")
+print(prop.table(table(qal$progressed)))
+
+glimpse(qal)
+```
+
+---
+
+# 4. Train / Test Split
+
+Data is split into 70% training and 30% testing
+
+```{r}
+split_obj  <- initial_split(qal, prop = 0.70, strata = "progressed")
+train_data <- training(split_obj)
+test_data  <- testing(split_obj)
+
+cat(sprintf("Training set : %d rows  (%.1f%%)\n",
+            nrow(train_data), 100 * nrow(train_data) / nrow(qal)))
+cat(sprintf("Test set     : %d rows  (%.1f%%)\n",
+            nrow(test_data),  100 * nrow(test_data)  / nrow(qal)))
+
+# Verify class balance is preserved
+cat("\nTrain progression rate:", round(mean(train_data$progressed == "Yes"), 3), "\n")
+cat("Test  progression rate:", round(mean(test_data$progressed  == "Yes"), 3), "\n")
+```
+
+---
+
+# 5. Data Preparation
+
+```{r}
+# ── A shared recipe applied to all models ────────────────────────────────────
+prep_recipe <- recipe(progressed ~ ., data = train_data) %>%
+
+  # Lump rare factor levels (< 3 % of data) into "Other"
+  step_other(all_nominal_predictors(), threshold = 0.03) %>%
+
+  # One-hot encode all categoricals (needed for XGBoost & Logistic)
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+
+  # Remove zero-variance columns created by dummy encoding
+  step_zv(all_predictors()) %>%
+
+  # Normalise numeric columns (none here, but safe to include)
+  step_normalize(all_numeric_predictors())
+
+prepped   <- prep(prep_recipe, training = train_data)
+train_baked <- bake(prepped, new_data = train_data)
+test_baked  <- bake(prepped, new_data = test_data)
+
+cat("Features after pre-processing:", ncol(train_baked) - 1, "\n")
+```
+
+---
+
+# 6. Model 1 — Logistic Regression
+
+This is the baseline model. It gives an odds ratio revealing how each variable affects the change of progression
+
+```{r}
+# Fit on training data 
+logit_fit <- glm(
+  progressed ~ .,
+  data   = train_baked,
+  family = binomial(link = "logit")
+)
+
+# Predict probabilities on test set 
+logit_prob <- predict(logit_fit, newdata = test_baked, type = "response")
+logit_class <- factor(if_else(logit_prob >= 0.5, "Yes", "No"),
+                      levels = c("No", "Yes"))
+
+# Confusion matrix & basic metrics 
+cm_logit <- confusionMatrix(logit_class, test_baked$progressed, positive = "Yes")
+print(cm_logit)
+
+# AUC 
+roc_logit <- roc(
+  response  = test_baked$progressed,
+  predictor = logit_prob,
+  levels    = c("No", "Yes")
+)
+cat(sprintf("\nLogistic Regression AUC: %.4f\n", auc(roc_logit)))
+```
+
+```{r}
+# Top-20 odds ratios (actionable insight) 
+or_df <- broom::tidy(logit_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(estimate)) %>%
+  slice(c(1:10, (n()-9):n()))   # top 10 & bottom 10
+
+ggplot(or_df, aes(x = reorder(term, estimate),
+                  y = estimate,
+                  colour = estimate > 1)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey") +
+  coord_flip() +
+  scale_colour_manual(values = c("TRUE" = "lightgreen", "FALSE" = "pink"),
+                      labels = c("TRUE" = "Increases odds", "FALSE" = "Decreases odds"),
+                      name   = "") +
+  labs(
+    title    = "Logistic Regression — Top & Bottom 10 Odds Ratios",
+    subtitle = "Values > 1 increase the probability of lead progression",
+    x = NULL,
+    y = "Odds Ratio (exponentiated coefficient)"
+  )
+```
+
+```{r}
+# Full coefficient table 
+broom::tidy(logit_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  arrange(p.value) %>%
+  head(30) %>%
+  gt() %>%
+  tab_header(title = "Logistic Regression: Top 30 Significant Predictors (by p-value)") %>%
+  cols_label(
+    term      = "Feature",
+    estimate  = "Odds Ratio",
+    std.error = "Std. Error",
+    statistic = "z",
+    p.value   = "p-value",
+    conf.low  = "95% CI Low",
+    conf.high = "95% CI High"
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightblue"),
+    locations = cells_body(rows = p.value < 0.05)
+  )
+```
+
+---
+
+# 7. Model 2 — Gradient Boosting (XGBoost)
+
+XGBoost captures non-linear interactions between variables
+
+```{r}
+# Convert to DMatrix format 
+X_train <- train_baked %>% select(-progressed) %>% as.matrix()
+y_train <- as.integer(train_baked$progressed == "Yes")
+
+X_test  <- test_baked  %>% select(-progressed) %>% as.matrix()
+y_test  <- as.integer(test_baked$progressed  == "Yes")
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+```
+
+```{r}
+# Train with cross-validated early stopping 
+xgb_params <- list(
+  objective         = "binary:logistic",
+  eval_metric       = "auc",
+  eta               = 0.05,         
+  max_depth         = 5,
+  subsample         = 0.80,
+  colsample_bytree  = 0.80,
+  min_child_weight  = 10,
+  gamma             = 1
+)
+
+set.seed(42)
+xgb_cv <- xgb.cv(
+  params    = xgb_params,
+  data      = dtrain,
+  nrounds   = 500,
+  nfold     = 5,
+  early_stopping_rounds = 30,
+  verbose   = 0,
+  prediction = FALSE
+)
+
+best_nrounds <- xgb_cv$niter
+if (!is.null(xgb_cv$evaluation_log) && "test_auc_mean" %in% names(xgb_cv$evaluation_log)) {
+  best_nrounds <- which.max(xgb_cv$evaluation_log$test_auc_mean)
+}
+
+best_nrounds <- as.integer(best_nrounds)
+
+cat(sprintf("Best number of rounds (CV): %d\n", best_nrounds))
+
+xgb_fit <- xgb.train(
+  params  = xgb_params,
+  data    = dtrain,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+```
+
+```{r}
+# Predict & evaluate 
+xgb_prob  <- predict(xgb_fit, dtest)
+xgb_class <- factor(if_else(xgb_prob >= 0.5, "Yes", "No"),
+                    levels = c("No", "Yes"))
+
+cm_xgb <- confusionMatrix(xgb_class,
+                           factor(if_else(y_test == 1, "Yes", "No"),
+                                  levels = c("No","Yes")),
+                           positive = "Yes")
+print(cm_xgb)
+
+roc_xgb <- roc(
+  response  = y_test,
+  predictor = xgb_prob
+)
+cat(sprintf("\nXGBoost AUC: %.4f\n", auc(roc_xgb)))
+```
+
+```{r}
+# Feature importance 
+xgb_imp <- xgb.importance(
+  feature_names = colnames(X_train),
+  model         = xgb_fit
+)
+
+xgb_imp %>%
+  slice_head(n = 25) %>%
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "orange") +
+  coord_flip() +
+  labs(
+    title    = "XGBoost — Top 25 Features by Gain",
+    subtitle = "Gain = average improvement in loss when a feature is used to split",
+    x = NULL,
+    y = "Gain"
+  )
+```
+
+---
+
+# 8. Model 3 — Random Forest
+
+Random Forest is stable and handles lots of variables well 
+
+```{r}
+# Fit (500 trees, default mtry = sqrt(p))
+train_baked[is.na(train_baked)] <- 0
+
+
+set.seed(42)
+rf_fit <- randomForest(
+  progressed ~ .,
+  data       = train_baked,
+  ntree      = 500,
+  importance = TRUE,
+  classwt    = c("No" = 1, "Yes" = 4)  
+)
+
+print(rf_fit)
+```
+
+```{r}
+# Predict & evaluate 
+rf_prob  <- predict(rf_fit, newdata = test_baked, type = "prob")[, "Yes"]
+rf_class <- predict(rf_fit, newdata = test_baked, type = "class")
+
+cm_rf <- confusionMatrix(rf_class, test_baked$progressed, positive = "Yes")
+print(cm_rf)
+
+roc_rf <- roc(
+  response  = test_baked$progressed,
+  predictor = rf_prob,
+  levels    = c("No", "Yes")
+)
+cat(sprintf("\nRandom Forest AUC: %.4f\n", auc(roc_rf)))
+```
+
+```{r}
+
+rf_imp_df <- data.frame(
+  Feature   = rownames(importance(rf_fit)),
+  MeanDecreaseGini = importance(rf_fit)[, "MeanDecreaseGini"]
+) %>%
+  arrange(desc(MeanDecreaseGini)) %>%
+  slice_head(n = 25)
+
+ggplot(rf_imp_df, aes(x = reorder(Feature, MeanDecreaseGini),
+                      y = MeanDecreaseGini)) +
+  geom_col(fill = "lightgreen") +
+  coord_flip() +
+  labs(
+    title    = "Random Forest — Top 25 Features by Mean Decrease in Gini",
+    subtitle = "Higher values = greater contribution to splitting purity",
+    x = NULL,
+    y = "Mean Decrease Gini"
+  )
+```
+
+---
+
+# 9. Model Comparison & ROC Curves
+
+```{r}
+# Overlay all three ROC curves 
+ggroc(
+  list(
+    "Logistic Regression" = roc_logit,
+    "XGBoost"             = roc_xgb,
+    "Random Forest"       = roc_rf
+  ),
+  legacy.axes = TRUE,
+  size = 1
+) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey") +
+  scale_colour_manual(
+    values = c(
+      "Logistic Regression" = "pink",
+      "XGBoost"             = "orange",
+      "Random Forest"       = "lightgreen"
+    )
+  ) +
+  annotate("text", x = 0.65, y = 0.20,
+           label = sprintf(
+             "AUC\nLogit : %.3f\nXGBoost: %.3f\nRF     : %.3f",
+             auc(roc_logit), auc(roc_xgb), auc(roc_rf)
+           ),
+           hjust = 0, size = 4, family = "mono") +
+  labs(
+    title   = "ROC Curve Comparison — All Three Models",
+    x       = "False Positive Rate (1 – Specificity)",
+    y       = "True Positive Rate (Sensitivity)",
+    colour  = "Model"
+  )
+```
+
+```{r}
+# Side-by-side performance table 
+extract_metrics <- function(cm, roc_obj, model_name) {
+  data.frame(
+    Model      = model_name,
+    AUC        = round(as.numeric(auc(roc_obj)), 4),
+    Accuracy   = round(cm$overall["Accuracy"], 4),
+    Precision  = round(cm$byClass["Precision"], 4),
+    Recall     = round(cm$byClass["Recall"], 4),
+    F1         = round(cm$byClass["F1"], 4),
+    Specificity = round(cm$byClass["Specificity"], 4)
+  )
+}
+
+metrics_df <- bind_rows(
+  extract_metrics(cm_logit, roc_logit, "Logistic Regression"),
+  extract_metrics(cm_xgb,   roc_xgb,   "XGBoost"),
+  extract_metrics(cm_rf,    roc_rf,    "Random Forest")
+)
+
+metrics_df %>%
+  gt() %>%
+  tab_header(title = "Model Performance Summary — Test Set") %>%
+  fmt_number(columns = -Model, decimals = 4) %>%
+  tab_style(
+    style = list(cell_fill(color = "lightblue"),
+                 cell_text(weight = "bold")),
+    locations = cells_body(
+      rows = AUC == max(AUC)
+    )
+  )
+```
+
+---
+
+# 10. Calibration Plot (Best Model)
+
+This checks how well predicted probabilities match reality. Can we trust the scores?
+
+```{r}
+# uses the best performing model
+best_prob <- xgb_prob
+best_actual <- y_test
+
+cal_df <- data.frame(
+  prob   = best_prob,
+  actual = best_actual
+) %>%
+  mutate(bin = cut(prob, breaks = seq(0, 1, by = 0.1),
+                   include.lowest = TRUE)) %>%
+  group_by(bin) %>%
+  summarise(
+    mean_pred  = mean(prob),
+    mean_actual = mean(actual),
+    n          = n(),
+    .groups    = "drop"
+  )
+
+ggplot(cal_df, aes(x = mean_pred, y = mean_actual)) +
+  geom_point(aes(size = n), colour = "orange") +
+  geom_line(colour = "orange") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey") +
+  scale_size_continuous(name = "N in bin") +
+  labs(
+    title    = "Calibration Plot — XGBoost",
+    subtitle = "Points near the diagonal indicate well-calibrated probabilities",
+    x = "Mean Predicted Probability",
+    y = "Observed Progression Rate"
+  )
+```
+
+---
+
+# 11. Threshold Optimisation
+
+The default 0.50 threshold maximizes accuracy.
+But for sales, we check
+
+Lower threshold → catch more good leads (higher recall)
+Higher threshold → fewer false positives (higher precision)
+
+We test different thresholds to find the best balance.
+
+```{r}
+# Precision-Recall tradeoff for XGBoost 
+thresholds <- seq(0.10, 0.70, by = 0.05)
+
+thresh_df <- purrr::map_dfr(thresholds, function(t) {
+  pred_class <- factor(if_else(xgb_prob >= t, "Yes", "No"),
+                       levels = c("No", "Yes"))
+  actual     <- factor(if_else(y_test == 1, "Yes", "No"),
+                       levels = c("No", "Yes"))
+  cm         <- confusionMatrix(pred_class, actual, positive = "Yes")
+  data.frame(
+    Threshold  = t,
+    Precision  = cm$byClass["Precision"],
+    Recall     = cm$byClass["Recall"],
+    F1         = cm$byClass["F1"],
+    Specificity = cm$byClass["Specificity"]
+  )
+})
+
+thresh_long <- thresh_df %>%
+  pivot_longer(-Threshold, names_to = "Metric", values_to = "Value")
+
+ggplot(thresh_long, aes(x = Threshold, y = Value, colour = Metric)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(
+    Precision   = "lightgreen",
+    Recall      = "pink",
+    F1          = "orange",
+    Specificity = "lightblue"
+  )) +
+  labs(
+    title    = "XGBoost — Precision / Recall / F1 Across Decision Thresholds",
+    subtitle = "Lower threshold → higher recall; higher threshold → higher precision",
+    x = "Classification Threshold",
+    y = "Metric Value",
+    colour = "Metric"
+  )
+
+# Highlight the F1-optimal threshold
+best_thresh_row <- thresh_df %>%
+  filter(!is.na(F1)) %>%
+  slice_max(F1, n = 1)
+cat(sprintf("F1-optimal threshold: %.2f  (Precision=%.3f, Recall=%.3f, F1=%.3f)\n",
+            best_thresh_row$Threshold,
+            best_thresh_row$Precision,
+            best_thresh_row$Recall,
+            best_thresh_row$F1))
+```
+
+---
+
+# 12. Lead Scoring & Actionable Segments
+
+We use the best model to score every lead.
+
+```{r}
+# score the full dataset 
+full_baked <- bake(prepped, new_data = qal)
+X_full     <- full_baked %>% select(-progressed) %>% as.matrix()
+
+qal_scored <- qal %>%
+  mutate(
+    progression_score = predict(
+      xgb_fit,
+      xgb.DMatrix(data = X_full)
+    ),
+    score_tier = case_when(
+      progression_score >= 0.40 ~ "Hot   (≥40%)",
+      progression_score >= 0.25 ~ "Warm  (25–40%)",
+      progression_score >= 0.15 ~ "Lukewarm (15–25%)",
+      TRUE                      ~ "Cold  (<15%)"
+    )
+  )
+
+qal_scored %>%
+  count(score_tier) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  gt() %>%
+  tab_header(title = "Lead Score Distribution — Full Dataset")
+```
+
+```{r}
+# Mean score by key segments 
+seg_mfg <- qal_scored %>%
+  group_by(acct_manufacturing_model) %>%
+  summarise(
+    n             = n(),
+    mean_score    = mean(progression_score),
+    actual_rate   = mean(progressed == "Yes"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_score))
+
+p1 <- ggplot(seg_mfg,
+       aes(x = reorder(acct_manufacturing_model, mean_score),
+           y = mean_score)) +
+  geom_col(fill = "lightgreen") +
+  geom_text(aes(label = scales::percent(mean_score, accuracy = 0.1)),
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 0.45)) +
+  labs(title = "Mean Progression Score\nby Manufacturing Model",
+       x = NULL, y = "Mean Score")
+
+seg_func <- qal_scored %>%
+  group_by(function_band) %>%
+  summarise(
+    n          = n(),
+    mean_score = mean(progression_score),
+    .groups    = "drop"
+  ) %>%
+  arrange(desc(mean_score))
+
+p2 <- ggplot(seg_func,
+       aes(x = reorder(function_band, mean_score),
+           y = mean_score)) +
+  geom_col(fill = "orange") +
+  geom_text(aes(label = scales::percent(mean_score, accuracy = 0.1)),
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 0.45)) +
+  labs(title = "Mean Progression Score\nby Functional Area",
+       x = NULL, y = "Mean Score")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r top-segment-table}
+# ICP Cluster Table 
+qal_scored %>%
+  filter(solution_rollup == "Mx") %>%
+  group_by(acct_manufacturing_model, acct_tier_rollup, function_band) %>%
+  summarise(
+    n              = n(),
+    mean_score     = round(mean(progression_score), 3),
+    actual_rate    = round(mean(progressed == "Yes"), 3),
+    .groups        = "drop"
+  ) %>%
+  filter(n >= 50) %>%
+  arrange(desc(mean_score)) %>%
+  slice_head(n = 20) %>%
+  gt() %>%
+  tab_header(
+    title    = "Top Mx ICP Clusters — Manufacturing Model × Tier × Function",
+    subtitle = "Ranked by mean predicted progression score (min. 50 leads)"
+  ) %>%
+  fmt_number(columns = c(mean_score, actual_rate), decimals = 3) %>%
+  tab_style(
+    style     = cell_fill(color = "lightblue"),
+    locations = cells_body(rows = mean_score >= 0.30)
+  )
+```
+
+---
+
+# 13. Mx vs Qx Progression Score Comparison
+Qx leads generally have higher scores overall
+Mx still has strong opportunities, especially in high-scoring segments
+
+```{r}
+qal_scored %>%
+  filter(solution_rollup %in% c("Mx", "Qx")) %>%
+  ggplot(aes(x = progression_score, fill = solution_rollup)) +
+  geom_density(alpha = 0.55) +
+  scale_fill_manual(values = c("Mx" = "orange", "Qx" = "lightgreen")) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    title    = "Predicted Progression Score Distribution: Mx vs Qx",
+    subtitle = "Qx distribution shifted right confirms stronger baseline; Mx has opportunity in right tail",
+    x        = "Predicted Progression Probability",
+    y        = "Density",
+    fill     = "Product"
+  )
+```
+
+# Mx Targeting Strategy
+
+```{r mx-targeting-playbook, message=FALSE, warning=FALSE}
+# Create actionable Mx targeting strategy based on model results
+
+# Analyze Mx segments by key characteristics
+mx_segments <- qal_scored %>%
+  filter(solution_rollup == "Mx") %>%
+  group_by(acct_manufacturing_model, acct_tier_rollup) %>%
+  summarise(
+    n_leads = n(),
+    avg_score = mean(progression_score),
+    actual_rate = mean(progressed == "Yes"),
+    .groups = "drop"
+  ) %>%
+  filter(n_leads >= 30) %>%  # Minimum sample size
+  arrange(desc(avg_score))
+
+# Show top and bottom segments
+cat("=== MX TARGETING PLAYBOOK ===\n\n")
+cat("HIGH-PRIORITY MX SEGMENTS (Target These):\n")
+
+top_5 <- mx_segments %>%
+  slice_head(n = 5) %>%
+  mutate(
+    avg_score = scales::percent(avg_score, accuracy = 0.1),
+    actual_rate = scales::percent(actual_rate, accuracy = 0.1)
+  )
+
+print(as.data.frame(top_5), row.names = FALSE)
+
+cat("\n\nLOW-PRIORITY MX SEGMENTS (Avoid These):\n")
+
+bottom_5 <- mx_segments %>%
+  slice_tail(n = 5) %>%
+  mutate(
+    avg_score = scales::percent(avg_score, accuracy = 0.1),
+    actual_rate = scales::percent(actual_rate, accuracy = 0.1)
+  )
+
+print(as.data.frame(bottom_5), row.names = FALSE)
+
+# Calculate improvement potential
+high_priority <- qal_scored %>%
+  filter(solution_rollup == "Mx",
+         progression_score >= 0.18)  # Above baseline threshold
+
+all_mx <- qal_scored %>%
+  filter(solution_rollup == "Mx")
+
+cat("\n\n=== EXPECTED IMPACT ===\n")
+cat("Current Mx baseline:", scales::percent(mean(all_mx$progression_score), accuracy = 0.1), "\n")
+cat("High-priority segments (>18% predicted):", 
+    scales::percent(mean(high_priority$progression_score), accuracy = 0.1), "\n")
+cat("Number of high-priority leads:", nrow(high_priority), 
+    "out of", nrow(all_mx), 
+    paste0("(", round(100*nrow(high_priority)/nrow(all_mx), 1), "%)"), "\n")
+cat("Improvement potential: +", 
+    round((mean(high_priority$progression_score) - mean(all_mx$progression_score)) * 100, 1),
+    "percentage points\n")
+```
+Mx Targeting Strategy: 
+
+Clear winners: Small companies with CMO/CDMO or In-House models (20-24% predicted). 
+
+Clear losers: Services, Software, Research companies (<7% predicted) - not actual manufacturers.
+
+Bottom line: Only 23.5% of Mx leads are high-priority (>18% predicted). Focusing on these improves Mx from 12.4% baseline to ~35%.
+
+For SDRs: Target CMO/CDMO + Small and In-House + Small. Avoid Services/Software segments.
+
+---
+
+# 14. Key Findings & Actionable Recommendations
+This modeling helped to uncover lead progression using prediction on the available data. Out of the different models explored, XGBoost performed the best. logistic regression helped with the interpretation. 
+
+The most important factor is the manufacturing model (how a company produces products) as it directly shows a company's need for the product. Account tier, job function, and seniority also help identify leads. 
+
+Limitations of this modeling include:
+Limited data quality - some variables have missing values or used heavy cleaning reducing accuracy
+class imbalance- ~15% of leads actually progress, so model may struggle to correctly identify all positive cases
+over fitting - may not totally generalize 
+xgboost is not as explainable as logistic regression
+no changes over time are captured in the model
+
+
+#AI LOG
+AI was used to help formulate and debug coding, especially for the figures used. 
+Some help was sought confirming output interpretation
+
