@@ -1,4 +1,5 @@
 # MasterControlSoloWork
+## See https://github.com/cjcall99/Group-5-Capstone-MasterControl for full group project repository 
 
 This repository contains my R Markdown and HTML files for the exploratory data analysis and modeling conducted for MasterControl’s manufacturing (Mx) and quality (Qx) product lines. The final deliverable was completed as part of a four person team for a Master’s Capstone practice project.
 
@@ -38,3 +39,15 @@ Evaluate model performance and apply results in a business context
 Translate analytical outputs into actionable sales and marketing strategies
 Identify high  customer segments and ideal customers
 Collaborate effectively within a team to produce reproducible insights
+
+## Repository Contents
+April Master Control -EDA.Rmd - R Script, Exploratory Data Analysis, initial data cleaning and data insights 
+
+April-Master-Control--EDA.html - HTML file of Exploratory Data Analysis
+
+Modeling-Mastercontrol_April-Add.Rmd - R Markdown file containing my initial predictive modeling workflow and model evaluation.
+
+Modeling-Mastercontrol_April-Add.html - HTML file containting my intial predictive modeling workflow and model evaluation.
+
+README.md
+Project documentation describing the business problem and project insights
